@@ -29,7 +29,7 @@ except ImportError:
 
 
 class LLMClient:
-    """大模型API客户端 - 支持阿里云百炼(Qwen)"""
+    """大模型API客户端 - 支持多提供商"""
 
     PROVIDERS = {
         "qwen": {
@@ -37,10 +37,15 @@ class LLMClient:
             "model": "qwen-turbo",
             "env_key": "DASHSCOPE_API_KEY"
         },
-        "qwen-plus": {
-            "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-            "model": "qwen-plus",
-            "env_key": "DASHSCOPE_API_KEY"
+        "deepseek": {
+            "base_url": "https://api.deepseek.com/v1",
+            "model": "deepseek-chat",
+            "env_key": "DEEPSEEK_API_KEY"
+        },
+        "doubao": {
+            "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+            "model": "doubao-seed-1.8",
+            "env_key": "VOLCENGINE_API_KEY"
         }
     }
 
@@ -60,15 +65,11 @@ class LLMClient:
             self.use_mock = True
 
         if not self.use_mock:
-            print(f"✅ 使用 {provider} API: {self.model}")
+            print(f"✅ {provider} 就绪: {self.model}")
 
-    def chat(
-        self,
-        system_prompt: str,
-        user_content: str,
-        history: Optional[List[Dict]] = None,
-        role: str = None
-    ) -> Generator[str, None, None]:
+    def chat(self, system_prompt: str, user_content: str,
+             history: Optional[List[Dict]] = None,
+             role: str = None) -> Generator[str, None, None]:
         """流式对话"""
         if self.use_mock:
             detected_role = role or self._detect_role(system_prompt)
@@ -95,10 +96,8 @@ class LLMClient:
             try:
                 response = requests.post(
                     f"{self.base_url}/chat/completions",
-                    headers=headers,
-                    json=data,
-                    stream=True,
-                    timeout=30
+                    headers=headers, json=data,
+                    stream=True, timeout=30
                 )
 
                 if response.status_code != 200:
@@ -124,15 +123,14 @@ class LLMClient:
                 if attempt < 2:
                     time.sleep(2 ** attempt)
                 else:
-                    yield f"\n[系统提示：AI服务暂时不可用。错误：{str(e)}]"
+                    yield f"\n[系统提示：{self.provider} 服务不可用。错误：{str(e)}]"
                     return
 
     def _detect_role(self, system_prompt: str) -> str:
-        """检测角色"""
         sp = system_prompt.lower()
         if "advocate" in sp or "正方" in sp or "辩护" in sp:
             return "advocate"
-        elif "skeptic" in sp or "反方" in sp or "质疑" in sp or "追问" in sp:
+        elif "skeptic" in sp or "反方" in sp or "质疑" in sp:
             return "skeptic"
         elif "judge" in sp or "评委" in sp:
             return "judge"
@@ -141,34 +139,35 @@ class LLMClient:
     def _mock_chat_by_role(self, role: str) -> Generator[str, None, None]:
         """按角色返回 Mock 内容"""
         responses = {
-            "advocate": "您的决策有其合理性。从已有信息来看，继续推进可以充分利用已投入的资源，避免前期努力付诸东流。",
-            "skeptic": "如果不考虑已经投入的成本，您还会做同样的选择吗？这是一个关键的思考角度。",
+            "advocate": f"【正方-{self.provider}】您的决策有其合理性。从已有信息来看，继续推进可以充分利用已投入的资源，避免前期努力付诸东流。",
+            "skeptic": f"【反方-{self.provider}】如果不考虑已经投入的成本，您还会做同样的选择吗？这是一个关键的思考角度。",
             "judge": '{"round": 1, "primary_bias": "沉没成本谬误", "debate_status": "continuing", "next_focus": "验证投入是否可收回", "suggestion": "建议重新评估决策的独立价值", "evaluation": {"bias_probability": 75, "impact_level": "高", "confidence": 0.8}}',
-            "unknown": "模拟回复。"
+            "unknown": f"【未知-{self.provider}】模拟回复。"
         }
         yield responses.get(role, responses["unknown"])
 
-    def chat_sync(self, system_prompt: str, user_content: str, history=None, role=None) -> str:
-        """同步调用"""
+    def chat_sync(self, system_prompt: str, user_content: str,
+                  history=None, role=None) -> str:
         return "".join(self.chat(system_prompt, user_content, history, role=role))
 
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("🧪 LLMClient 测试")
+    print("🧪 三AI测试 (Qwen + DeepSeek + Doubao)")
     print("=" * 50)
 
-    client = LLMClient(use_mock=True)
-
-    tests = [
-        ("advocate", "正方测试"),
-        ("skeptic", "反方测试"),
-        ("judge", "评委测试"),
+    configs = [
+        ("qwen", "advocate", "正方"),
+        ("deepseek", "skeptic", "反方"),
+        ("doubao", "judge", "评委"),
     ]
 
-    for role, label in tests:
-        print(f"\n🧪 {label}:")
-        for token in client.chat("system", "user", role=role):
-            print(token)
-
-    print("\n✅ 全部完成！")
+    for provider, role_key, role_name in configs:
+        print(f"\n🧪 {role_name} ({provider}):")
+        try:
+            client = LLMClient(provider=provider, use_mock=True)
+            for token in client.chat("system", "user", role=role_key):
+                print(token, end="")
+            print()
+        except Exception as e:
+            print(f"❌ 错误: {e}")
