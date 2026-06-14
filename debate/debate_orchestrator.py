@@ -29,15 +29,16 @@ load_env_file(PROJECT_ROOT / ".env")
 from debate.llm_client import LLMClient
 from debate.state_machine import DebateStateMachine, DebateState
 
-# 尝试导入上游模块（韩琴的），失败则用Mock
+# 导入上游模块（崔庆芳 + 杨惠蓝 + 韩琴）
 try:
     from core.bias_detector import BiasDetector
     UPSTREAM_READY = True
-except ImportError:
+except ImportError as e:
     UPSTREAM_READY = False
-    print("⚠️ 上游模块未就绪，使用Mock数据")
+    print(f"⚠️ 上游模块导入失败: {e}")
+    print("   将使用 Mock 数据继续")
 
-# Mock数据（韩琴完成前使用）
+# 降级用的 Mock 数据
 MOCK_DEBATE_FOCUS = {
     "primary_target": "沉没成本谬误",
     "primary_confidence": 0.85,
@@ -66,11 +67,12 @@ class DebateOrchestrator:
         self.state_machine: Optional[DebateStateMachine] = None
         self.debate_focus: Optional[Dict] = None
         self.user_input: Optional[str] = None
+        self.detection_result: Optional[Dict] = None
 
         # 加载Prompt文件
         self.prompts = self._load_prompts()
 
-        # 缓存机制（用于演示优化）
+        # 缓存机制
         self._cache: Dict[str, List[Dict]] = {}
 
     def _load_prompts(self) -> Dict[str, str]:
@@ -90,16 +92,30 @@ class DebateOrchestrator:
         return prompts
 
     def _get_detection_result(self, user_input: str) -> Dict:
-        """获取偏差检测结果"""
+        """
+        获取偏差检测结果
+        上游就绪用真实数据，否则用Mock降级
+        """
         if UPSTREAM_READY:
             try:
                 detector = BiasDetector()
-                return detector.detect(user_input)
+                result = detector.detect(user_input)
+                print(f"✅ 使用真实检测数据: {result.get('primary_bias', {}).get('bias_name', '未知')}")
+                return result
             except Exception as e:
-                print(f"⚠️ 检测器调用失败，回退到Mock: {e}")
-                return {"debate_focus": MOCK_DEBATE_FOCUS}
+                print(f"⚠️ 检测器调用失败，降级到Mock: {e}")
+                return {
+                    "debate_focus": MOCK_DEBATE_FOCUS,
+                    "primary_bias": {"bias_name": "沉没成本谬误", "confidence": 0.5},
+                    "risk_level": "中"
+                }
         else:
-            return {"debate_focus": MOCK_DEBATE_FOCUS}
+            print("⚠️ 上游模块未就绪，使用Mock数据")
+            return {
+                "debate_focus": MOCK_DEBATE_FOCUS,
+                "primary_bias": {"bias_name": "沉没成本谬误", "confidence": 0.5},
+                "risk_level": "中"
+            }
 
     def _format_focus_for_prompt(self, focus: Dict) -> str:
         """将debate_focus格式化为Prompt可用的字符串"""
@@ -153,9 +169,9 @@ class DebateOrchestrator:
                 yield item
             return
 
-        # 获取偏差检测结果
-        detection_result = self._get_detection_result(user_input)
-        self.debate_focus = detection_result.get("debate_focus", MOCK_DEBATE_FOCUS)
+        # 获取偏差检测结果（真实或Mock）
+        self.detection_result = self._get_detection_result(user_input)
+        self.debate_focus = self.detection_result.get("debate_focus", MOCK_DEBATE_FOCUS)
 
         # 准备Prompt（替换变量）
         self.prompts = self._base_prompts.copy()
@@ -166,7 +182,7 @@ class DebateOrchestrator:
         # 初始化状态机
         self.state_machine = DebateStateMachine(max_rounds=3)
 
-        # 运行辩论并收集结果（用于缓存）
+        # 运行辩论并收集结果
         results = []
         for result in self._run_debate():
             results.append(result)
@@ -198,7 +214,7 @@ class DebateOrchestrator:
                     "judge_data": None,
                     "user_can_intervene": True
                 }
-                return  # 暂停，等待用户输入
+                return
 
         # 辩论结束
         if self.state_machine.is_concluded():
@@ -215,8 +231,6 @@ class DebateOrchestrator:
         """正方发言"""
         system_prompt = self.prompts["advocate"]
         user_content = self.user_input
-
-        # 构建历史上下文
         history = self._format_history_for_role("正方")
 
         content_parts = []
@@ -231,7 +245,6 @@ class DebateOrchestrator:
                 "user_can_intervene": False
             }
 
-        # 保存完整发言
         full_content = "".join(content_parts)
         self.state_machine.add_history("正方", full_content)
 
@@ -239,7 +252,6 @@ class DebateOrchestrator:
         """反方发言"""
         system_prompt = self.prompts["skeptic"]
 
-        # 获取正方发言作为输入
         round_history = self.state_machine.get_round_history()
         advocate_msgs = [h for h in round_history if h["speaker"] == "正方"]
 
@@ -269,7 +281,6 @@ class DebateOrchestrator:
         """评委评估"""
         system_prompt = self.prompts["judge"]
 
-        # 构建本轮辩论历史
         round_history = self.state_machine.get_round_history()
         history_text = "\n\n".join([
             f"【{h['speaker']}】{h['content']}"
@@ -300,7 +311,6 @@ class DebateOrchestrator:
         if judge_data and judge_data.get("debate_status") == "concluded":
             self.state_machine.force_conclude()
 
-        # 重新yield，包含解析后的数据
         yield {
             "round": self.state_machine.round,
             "status": "judge_turn",
@@ -312,13 +322,11 @@ class DebateOrchestrator:
 
     def _parse_judge_json(self, content: str) -> Optional[Dict]:
         """解析评委的JSON输出"""
-        # 尝试直接解析
         try:
             return json.loads(content)
         except json.JSONDecodeError:
             pass
 
-        # 尝试提取JSON块
         json_pattern = r'\{[\s\S]*?\}'
         matches = re.findall(json_pattern, content)
 
@@ -328,7 +336,6 @@ class DebateOrchestrator:
             except json.JSONDecodeError:
                 continue
 
-        # 回退：手动提取关键信息
         print("⚠️ 评委JSON解析失败，使用回退策略")
         return {
             "round": self.state_machine.round if self.state_machine else 1,
@@ -370,27 +377,36 @@ class DebateOrchestrator:
         if not self.state_machine:
             return {"error": "辩论尚未开始"}
 
+        # 获取检测阶段的主偏差
+        primary_from_detection = {}
+        if self.detection_result and "primary_bias" in self.detection_result:
+            pb = self.detection_result["primary_bias"]
+            primary_from_detection = {
+                "bias_name": pb.get("bias_name", "未知"),
+                "confidence": pb.get("confidence", 0)
+            }
+
+        # 收集评委历史
         judge_history = [
             h for h in self.state_machine.get_all_history()
             if h["speaker"] == "评委"
         ]
 
-        # 提取所有评委判定
         judge_evaluations = []
         for h in judge_history:
             data = self._parse_judge_json(h["content"])
             if data:
                 judge_evaluations.append(data)
 
-        # 获取主偏差信息
-        primary_bias = {}
-        if judge_evaluations:
+        # 优先使用检测阶段的主偏差，其次用评委判定
+        primary_bias = primary_from_detection
+        if not primary_bias and judge_evaluations:
             last_eval = judge_evaluations[-1]
             primary_bias = {
                 "bias_name": last_eval.get("primary_bias", "未知"),
                 "confidence": last_eval.get("evaluation", {}).get("confidence", 0)
             }
-        elif self.debate_focus:
+        elif not primary_bias and self.debate_focus:
             primary_bias = {
                 "bias_name": self.debate_focus.get("primary_target", "未知"),
                 "confidence": self.debate_focus.get("primary_confidence", 0)
@@ -404,19 +420,27 @@ class DebateOrchestrator:
         if judge_evaluations:
             final_suggestion = judge_evaluations[-1].get("suggestion", "无建议")
 
-        return {
+        # 构建完整报告
+        report = {
             "debate_rounds": self.state_machine.round,
             "primary_bias": primary_bias,
-            "secondary_biases": [],
+            "secondary_biases": self.detection_result.get("secondary_biases", []) if self.detection_result else [],
             "judge_history": judge_evaluations,
             "final_suggestion": final_suggestion,
             "risk_level": risk_level
         }
 
+        # 如果有检测阶段的额外信息，合并进来
+        if self.detection_result:
+            report["input_analysis"] = self.detection_result.get("input_analysis", {})
+            report["detected_biases"] = self.detection_result.get("detected_biases", [])
+
+        return report
+
     def _calculate_risk_level(self, evaluations: List[Dict]) -> str:
         """计算风险等级"""
         if not evaluations:
-            return "低"
+            return self.detection_result.get("risk_level", "低") if self.detection_result else "低"
 
         probabilities = []
         for e in evaluations:
@@ -435,19 +459,22 @@ class DebateOrchestrator:
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("🧪 DebateOrchestrator 完整测试")
+    print("🧪 DebateOrchestrator 完整测试（对接真实上游）")
     print("=" * 60)
 
+    # 测试：优先使用真实上游，失败则Mock
     orch = DebateOrchestrator(provider='qwen', use_mock=True)
+
+    print(f"\n上游模块状态: {'✅ 就绪' if UPSTREAM_READY else '⚠️ 使用Mock'}")
 
     print("\n🚀 启动辩论...")
     print("=" * 60)
 
-    for r in orch.start('我已经投了这么多钱，必须坚持'):
-        # 只显示最终完整内容
+    test_input = "我已经投了这么多钱，必须坚持"
+
+    for r in orch.start(test_input):
         if r['status'] in ['advocate_turn', 'skeptic_turn', 'judge_turn']:
             content = r['content']
-            # 判断是否为最终输出（长度>20且以标点结尾）
             if len(content) > 20 and content[-1] in '。！？.!?':
                 print(f'\n[{r["speaker"]}] {content}')
                 if r['judge_data']:
